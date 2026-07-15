@@ -23,6 +23,14 @@ EXCLUDE_REGEX="${EXCLUDE_REGEX:-}"
 
 log() { echo "[$(date -Is)] $*"; }
 
+is_valid_domain() {
+  # Strict FQDN check: labels/rules are untrusted input (compound rules,
+  # unbalanced parens, HostRegexp, etc. can produce garbage) — never hand
+  # anything unvalidated to lego.
+  local d="$1"
+  [[ "$d" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]
+}
+
 discover_domains() {
   # Pull Host(`...`) values out of every service's traefik router rules.
   docker service ls -q | xargs -r docker service inspect 2>/dev/null \
@@ -118,8 +126,19 @@ generate_dynamic_config() {
 
 run_once() {
   local domains d
-  domains="$(discover_domains || true)"
-  log "discovered: $(echo "$domains" | tr '\n' ' ')"
+  local raw valid=() bad=()
+  raw="$(discover_domains || true)"
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    if is_valid_domain "$d"; then
+      valid+=("$d")
+    else
+      bad+=("$d")
+    fi
+  done <<< "$raw"
+  domains="$(printf '%s\n' "${valid[@]:-}")"
+  log "discovered: ${valid[*]:-none}"
+  [[ ${#bad[@]} -gt 0 ]] && log "WARN: skipped invalid domain(s) from rule parsing: ${bad[*]} — check 'traefik.http.routers.*.rule' labels for compound/negated rules"
 
   # static/wildcard certs first
   if [[ -n "$STATIC_DOMAINS" ]]; then
