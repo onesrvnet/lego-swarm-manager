@@ -20,6 +20,13 @@ DNS_ZONES="${DNS_ZONES:-}"
 HTTP_CHALLENGE_PORT="${HTTP_CHALLENGE_PORT:-8402}"
 # Optional: regex of domains to ignore (e.g. internal ones)
 EXCLUDE_REGEX="${EXCLUDE_REGEX:-}"
+# Reachability preflight — probe a domain before EVERY ACME call so a
+# not-yet-configured host can't burn Let's Encrypt's failed-validation quota
+# (5 per hostname per hour) and lock out the whole account. Set PREFLIGHT=0
+# to disable.
+PREFLIGHT="${PREFLIGHT:-1}"
+DNS_RESOLVER="${DNS_RESOLVER:-1.1.1.1}"        # resolver for probes ("" = system)
+HTTP_PROBE_TIMEOUT="${HTTP_PROBE_TIMEOUT:-5}"  # seconds per HTTP reachability probe
 
 log() { echo "[$(date -Is)] $*"; }
 
@@ -76,6 +83,70 @@ lego_cert_file() {
   echo "$LEGO_PATH/certificates/$(echo "$1" | sed 's/\*/_/g').crt"
 }
 
+_dig() {
+  # dig wrapper that honours DNS_RESOLVER (empty = system resolver)
+  local args=(+short +time=3 +tries=2)
+  [[ -n "$DNS_RESOLVER" ]] && args+=("@$DNS_RESOLVER")
+  dig "${args[@]}" "$@" 2>/dev/null
+}
+
+dns_zone_resolvable() {
+  # $1=domain — true if some parent zone answers NS (i.e. the zone is delegated
+  # in public DNS). Walks up labels so it works without a Public Suffix List and
+  # doesn't require the (sub)domain itself to exist yet — DNS-01 only needs the
+  # zone so lego can place the _acme-challenge TXT.
+  local name="${1#\*.}"
+  while :; do
+    [[ -n "$(_dig NS "$name")" ]] && return 0
+    [[ "$name" != *.*.* ]] && return 1   # down to the apex, give up
+    name="${name#*.}"
+  done
+}
+
+cert_needs_renew() {
+  # $1=cert file — true if missing, unparseable, or within RENEW_DAYS of expiry.
+  # Lets us skip the probe+lego call entirely for healthy certs (no ACME work).
+  local crt="$1" end end_epoch now_epoch
+  [[ -f "$crt" ]] || return 0
+  end="$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | cut -d= -f2)"
+  [[ -n "$end" ]] || return 0
+  end_epoch="$(date -d "$end" +%s 2>/dev/null)" || return 0
+  now_epoch="$(date +%s)"
+  (( (end_epoch - now_epoch) / 86400 <= RENEW_DAYS ))
+}
+
+preflight_ok() {
+  # usage: preflight_ok <challenge:dns|http> <domain>
+  # Cheap reachability probe gating every ACME call. DNS-01 needs the zone to be
+  # delegated; HTTP-01 needs the domain to resolve AND answer on :80 (so the
+  # /.well-known/acme-challenge route can actually reach us).
+  [[ "$PREFLIGHT" == "1" ]] || return 0
+  local challenge="$1" domain="$2" probe="${2#\*.}"
+
+  if [[ "$challenge" == "dns" ]]; then
+    if dns_zone_resolvable "$domain"; then return 0; fi
+    log "preflight: skip $domain — no delegated DNS zone for $probe (not in DNS yet)"
+    return 1
+  fi
+
+  # HTTP-01
+  if [[ -z "$(_dig A "$probe")$(_dig AAAA "$probe")" ]]; then
+    log "preflight: skip $domain — no A/AAAA record (DNS not pointed here yet)"
+    return 1
+  fi
+  # -w always prints a status; on connection failure it's 000 and curl exits
+  # non-zero (|| true keeps set -e happy). Any real status (even 404) proves the
+  # host is reachable on :80; empty/000 means nothing answered.
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$HTTP_PROBE_TIMEOUT" \
+         "http://$probe/.well-known/acme-challenge/certd-preflight" 2>/dev/null || true)"
+  if [[ -z "$code" || "$code" == "000" ]]; then
+    log "preflight: skip $domain — no HTTP response on :80 (not routed here yet)"
+    return 1
+  fi
+  return 0
+}
+
 ensure_cert() {
   # usage: ensure_cert <challenge:dns|http> <domain> [extra lego args...]
   local challenge="$1" domain="$2"; shift 2
@@ -87,6 +158,17 @@ ensure_cert() {
     chal_args=(--http --http.port ":$HTTP_CHALLENGE_PORT")
   fi
   local crt; crt="$(lego_cert_file "$domain")"
+
+  # Healthy existing cert → no ACME work, so no probe and no lego call.
+  [[ -f "$crt" ]] && ! cert_needs_renew "$crt" && return 0
+
+  # Everything past here contacts ACME → gate on reachability first so we never
+  # spend failed-validation quota on a domain that can't complete the challenge.
+  if ! preflight_ok "$challenge" "$domain"; then
+    [[ -f "$crt" ]] && log "preflight failed for $domain — keeping existing cert, retry next cycle"
+    return 0
+  fi
+
   if [[ -f "$crt" ]]; then
     # renew is a no-op unless within RENEW_DAYS of expiry
     lego --accept-tos --email "$ACME_EMAIL" --server "$ACME_SERVER" \
