@@ -6,7 +6,7 @@ LABEL org.opencontainers.image.authors="onesrv, Regh & Meier Services GbR <info@
 LABEL org.opencontainers.image.source="https://github.com/onesrvnet/lego-swarm-manager"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
-RUN apk add --no-cache bash curl jq docker-cli coreutils grep sed bind-tools openssl
+RUN apk add --no-cache bash curl jq docker-cli coreutils grep sed openssl
 
 # lego (pin the version you've tested)
 ARG LEGO_VERSION=v4.17.4

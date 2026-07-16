@@ -11,7 +11,7 @@ On each cycle (`INTERVAL` seconds) the `certd.sh` entrypoint:
    - Domains under a zone listed in `DNS_ZONES` use **DNS-01** (required for wildcards).
    - Everything else falls back to **HTTP-01** via lego's internal challenge server (Traefik must route `/.well-known/acme-challenge/` to this container on `HTTP_CHALLENGE_PORT`).
    - Renewals are no-ops until within `RENEW_DAYS` of expiry.
-   - **Reachability preflight** (`PREFLIGHT=1`, default): before any ACME call the domain is probed. DNS-01 requires the zone to be delegated in public DNS. HTTP-01 runs a **self-test** — certd serves a random token on `HTTP_CHALLENGE_PORT` and fetches it back through the public domain; only a byte-exact round-trip proves the `/.well-known/acme-challenge` route actually reaches *this* container (a domain pointing at a different host answers port 80 but fails this check). Domains that fail are skipped, so a not-yet-configured host can't burn Let's Encrypt's failed-validation rate limit (5 per hostname per hour) and lock out the account. Healthy certs are never probed. Set `HTTP_SELFTEST=0` to fall back to a bare port-80 reachability check.
+   - **HTTP-01 reachability preflight** (`PREFLIGHT=1`, default): before issuing/renewing an HTTP-01 domain, certd makes the same request Let's Encrypt will — an HTTP GET to `http://<domain>/.well-known/acme-challenge/…`. If nothing answers over HTTP the challenge can't succeed, so the domain is skipped and no failed-validation quota (5 per hostname per hour) is spent. DNS-01 domains aren't probed (they validate via a TXT record, not host reachability), and healthy certs are skipped entirely.
 3. **Generates** `traefik-tls.yml` (a dynamic TLS config) atomically, which Traefik watches via its file provider.
 
 Certs and lego state live on a shared volume (e.g. CephFS) so any manager node can read them. Run **exactly one** `certd` replica — it is the single ACME writer.
@@ -39,10 +39,8 @@ ghcr.io/onesrvnet/lego-swarm-manager:<release-tag>
 | `RENEW_DAYS` | — | `30` | Renew when within this many days of expiry. |
 | `CERT_DIR` | — | `/letsencrypt` | Shared volume for lego state and generated config. |
 | `ACME_SERVER` | — | LE production | Set to the LE staging directory URL to test first. |
-| `PREFLIGHT` | — | `1` | Probe DNS/HTTP reachability before each ACME call. Set `0` to disable. |
-| `HTTP_SELFTEST` | — | `1` | HTTP-01: round-trip a token through the public domain to prove the challenge reaches this container. `0` = bare port-80 check. |
-| `DNS_RESOLVER` | — | `1.1.1.1` | Resolver used for preflight lookups (empty = system resolver). |
-| `HTTP_PROBE_TIMEOUT` | — | `5` | Seconds per HTTP-01 reachability probe. |
+| `PREFLIGHT` | — | `1` | HTTP GET the domain before an HTTP-01 issue/renew; skip if unreachable. Set `0` to disable. |
+| `HTTP_PROBE_TIMEOUT` | — | `5` | Seconds for the HTTP-01 reachability probe. |
 
 Provider credentials are passed as env vars per the [lego provider docs](https://go-acme.github.io/lego/dns/) (e.g. `CLOUDFLARE_DNS_API_TOKEN_FILE`).
 
