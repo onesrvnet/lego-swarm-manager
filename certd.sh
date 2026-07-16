@@ -27,6 +27,12 @@ EXCLUDE_REGEX="${EXCLUDE_REGEX:-}"
 PREFLIGHT="${PREFLIGHT:-1}"
 DNS_RESOLVER="${DNS_RESOLVER:-1.1.1.1}"        # resolver for probes ("" = system)
 HTTP_PROBE_TIMEOUT="${HTTP_PROBE_TIMEOUT:-5}"  # seconds per HTTP reachability probe
+# HTTP-01 self-test: serve a random token on HTTP_CHALLENGE_PORT and fetch it
+# back THROUGH the public domain. Only a full round-trip proves the
+# acme-challenge route actually reaches THIS container (a domain resolving to a
+# different host still answers :80 but would fail the real challenge). Set 0 to
+# fall back to a bare :80 reachability check.
+HTTP_SELFTEST="${HTTP_SELFTEST:-1}"
 
 log() { echo "[$(date -Is)] $*"; }
 
@@ -115,11 +121,43 @@ cert_needs_renew() {
   (( (end_epoch - now_epoch) / 86400 <= RENEW_DAYS ))
 }
 
+http_selftest() {
+  # $1=domain — true only if an HTTP-01 challenge would actually reach THIS
+  # container. Serves a random token on HTTP_CHALLENGE_PORT (the same port +
+  # /.well-known/acme-challenge path lego uses and Traefik routes to us) and
+  # fetches it back through the PUBLIC domain. A byte-exact round-trip is the
+  # only proof the route lands here — a domain that resolves to a different host
+  # answers :80 but returns something else (or 404), so we skip it and never
+  # spend Let's Encrypt validation quota on a challenge that can't succeed.
+  local domain="$1" token doc body rc=1 pid i
+  token="probe-$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 24)"
+  [[ "$token" == probe- ]] && token="probe-fallback"   # /dev/urandom missing
+  doc="$(mktemp -d)"
+  mkdir -p "$doc/.well-known/acme-challenge"
+  printf '%s' "$token" > "$doc/.well-known/acme-challenge/$token"
+
+  busybox httpd -f -p "0.0.0.0:$HTTP_CHALLENGE_PORT" -h "$doc" &
+  pid=$!
+  # wait for the listener to come up (max ~2s) via a loopback fetch
+  for i in $(seq 1 10); do
+    curl -fsS -o /dev/null --max-time 1 \
+      "http://127.0.0.1:$HTTP_CHALLENGE_PORT/.well-known/acme-challenge/$token" 2>/dev/null && break
+    sleep 0.2
+  done
+  body="$(curl -fsS --max-time "$HTTP_PROBE_TIMEOUT" \
+        "http://$domain/.well-known/acme-challenge/$token" 2>/dev/null || true)"
+  [[ "$body" == "$token" ]] && rc=0
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -rf "$doc"
+  return $rc
+}
+
 preflight_ok() {
   # usage: preflight_ok <challenge:dns|http> <domain>
-  # Cheap reachability probe gating every ACME call. DNS-01 needs the zone to be
-  # delegated; HTTP-01 needs the domain to resolve AND answer on :80 (so the
-  # /.well-known/acme-challenge route can actually reach us).
+  # Reachability probe gating every ACME call. DNS-01 needs the zone delegated;
+  # HTTP-01 needs the acme-challenge route to actually reach THIS container.
   [[ "$PREFLIGHT" == "1" ]] || return 0
   local challenge="$1" domain="$2" probe="${2#\*.}"
 
@@ -129,14 +167,17 @@ preflight_ok() {
     return 1
   fi
 
-  # HTTP-01
+  # HTTP-01 — must resolve first, then prove the challenge lands on us.
   if [[ -z "$(_dig A "$probe")$(_dig AAAA "$probe")" ]]; then
     log "preflight: skip $domain — no A/AAAA record (DNS not pointed here yet)"
     return 1
   fi
-  # -w always prints a status; on connection failure it's 000 and curl exits
-  # non-zero (|| true keeps set -e happy). Any real status (even 404) proves the
-  # host is reachable on :80; empty/000 means nothing answered.
+  if [[ "$HTTP_SELFTEST" == "1" ]]; then
+    if http_selftest "$probe"; then return 0; fi
+    log "preflight: skip $domain — acme-challenge round-trip did not reach this container (domain served elsewhere or not routed to :$HTTP_CHALLENGE_PORT)"
+    return 1
+  fi
+  # fallback: bare :80 reachability — does NOT prove the challenge reaches us.
   local code
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$HTTP_PROBE_TIMEOUT" \
          "http://$probe/.well-known/acme-challenge/certd-preflight" 2>/dev/null || true)"
@@ -246,6 +287,13 @@ run_once() {
 }
 
 mkdir -p "$LEGO_PATH"
+# HTTP-01 self-test needs busybox httpd; downgrade loudly rather than silently
+# skipping every HTTP domain if the applet is unavailable.
+if [[ "$PREFLIGHT" == "1" && "$HTTP_SELFTEST" == "1" ]] \
+   && ! busybox --list 2>/dev/null | grep -qx httpd; then
+  log "WARN: busybox httpd unavailable — disabling HTTP-01 self-test, falling back to bare :80 check"
+  HTTP_SELFTEST=0
+fi
 log "certd starting (interval ${INTERVAL}s, provider $DNS_PROVIDER)"
 while true; do
   run_once || log "WARN: cycle failed"
