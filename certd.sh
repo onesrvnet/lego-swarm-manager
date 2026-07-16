@@ -20,12 +20,13 @@ DNS_ZONES="${DNS_ZONES:-}"
 HTTP_CHALLENGE_PORT="${HTTP_CHALLENGE_PORT:-8402}"
 # Optional: regex of domains to ignore (e.g. internal ones)
 EXCLUDE_REGEX="${EXCLUDE_REGEX:-}"
-# HTTP-01 preflight — before issuing/renewing, do exactly what the challenge does:
-# an HTTP GET to the domain's /.well-known/acme-challenge/ path. If nothing answers
-# over HTTP the challenge can't succeed, so skip and don't spend Let's Encrypt's
-# failed-validation quota (5 per hostname per hour). Set PREFLIGHT=0 to disable.
+# HTTP-01 preflight — before issuing/renewing, dry-run the challenge: serve a
+# random token on the challenge port and fetch it back through the public domain.
+# Only a byte-exact round-trip means the real challenge will pass; if it doesn't
+# round-trip we skip and never spend Let's Encrypt's failed-validation quota
+# (5 per hostname per hour). Set PREFLIGHT=0 to disable.
 PREFLIGHT="${PREFLIGHT:-1}"
-HTTP_PROBE_TIMEOUT="${HTTP_PROBE_TIMEOUT:-5}"  # seconds for the HTTP reachability probe
+HTTP_PROBE_TIMEOUT="${HTTP_PROBE_TIMEOUT:-5}"  # seconds for the round-trip fetch
 
 log() { echo "[$(date -Is)] $*"; }
 
@@ -96,24 +97,44 @@ cert_needs_renew() {
 
 preflight_ok() {
   # usage: preflight_ok <challenge:dns|http> <domain>
-  # HTTP-01: make the same request Let's Encrypt will — GET the acme-challenge
-  # path over HTTP. Any response (even 404) means the host is reachable and the
-  # challenge has a chance; no response means it can't, so skip. DNS-01 validates
-  # via a TXT record, not host reachability, so there's nothing to probe.
+  # HTTP-01: dry-run the real challenge. Serve a random token on the challenge
+  # port (the same /.well-known/acme-challenge path Traefik routes to us) and
+  # fetch it back THROUGH the public domain. Only a byte-exact round-trip proves
+  # lego's challenge will succeed — a plain GET is worthless because any server
+  # (e.g. Cloudflare, or a host that isn't us) answers the path with a 404, which
+  # then fails the actual validation and burns quota. DNS-01 uses a TXT record,
+  # not host reachability, so it isn't probed.
   [[ "$PREFLIGHT" == "1" ]] || return 0
   local challenge="$1" domain="$2" probe="${2#\*.}"
   [[ "$challenge" == "dns" ]] && return 0
 
-  # -w always prints a status; on connection failure it's 000 and curl exits
-  # non-zero (|| true keeps set -e happy).
-  local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$HTTP_PROBE_TIMEOUT" \
-         "http://$probe/.well-known/acme-challenge/certd-preflight" 2>/dev/null || true)"
-  if [[ -z "$code" || "$code" == "000" ]]; then
-    log "preflight: skip $domain — no HTTP response on :80 (would fail HTTP-01)"
-    return 1
-  fi
-  return 0
+  local token doc body pid rc=1 i
+  token="certd-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  doc="$(mktemp -d)"
+  mkdir -p "$doc/.well-known/acme-challenge"
+  printf '%s' "$token" > "$doc/.well-known/acme-challenge/$token"
+
+  # tiny static server on the challenge port; killed before lego binds the same port
+  busybox httpd -f -p "$HTTP_CHALLENGE_PORT" -h "$doc" >/dev/null 2>&1 &
+  pid=$!
+  # wait (max ~2s) for the listener via a loopback fetch
+  for i in $(seq 1 10); do
+    curl -fsS -o /dev/null --max-time 1 \
+      "http://127.0.0.1:$HTTP_CHALLENGE_PORT/.well-known/acme-challenge/$token" 2>/dev/null && break
+    sleep 0.2
+  done
+  # fetch through the PUBLIC domain — this is exactly what Let's Encrypt does
+  body="$(curl -fsSL --max-time "$HTTP_PROBE_TIMEOUT" \
+        "http://$probe/.well-known/acme-challenge/$token" 2>/dev/null || true)"
+  [[ "$body" == "$token" ]] && rc=0
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -rf "$doc"
+
+  [[ $rc -eq 0 ]] && return 0
+  log "preflight: skip $domain — acme-challenge token did not round-trip (domain not routed to this container; HTTP-01 would fail)"
+  return 1
 }
 
 ensure_cert() {
